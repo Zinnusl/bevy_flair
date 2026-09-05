@@ -309,9 +309,25 @@ impl StyleProperties {
                     let value = transition.sample_value();
                     self.pending_computed_animation_values[property_id] = value.into();
                 }
+                // nexus-rs patch (3 of 3, part a): a finished or canceled
+                // transition emits its target only while the cascade still
+                // wants that target. If this frame recomputed the property to
+                // something else -- a class swap on the completion frame, or
+                // the cancellation's own after-change value -- nothing is
+                // emitted, and `apply_computed_properties` hands the property
+                // back to the computed value through its existing
+                // `Value -> None` branch. A completed or cancelled transition
+                // yields to the after-change style, as CSS says it must.
                 TransitionState::Finished | TransitionState::Canceled => {
-                    self.pending_computed_animation_values[property_id] =
-                        transition.to.clone().into();
+                    let cascade_moved_on = !self.pending_computed_values.is_empty()
+                        && !matches!(
+                            &self.pending_computed_values[property_id],
+                            ComputedValue::Value(target) if *target == transition.to
+                        );
+                    if !cascade_moved_on {
+                        self.pending_computed_animation_values[property_id] =
+                            transition.to.clone().into();
+                    }
                 }
             }
         }
@@ -554,6 +570,20 @@ impl StyleProperties {
         self.active_transitions().next().is_some() || self.active_animations().next().is_some()
     }
 
+    /// Returns true if there is any animation or transition at all, finished
+    /// and canceled ones included.
+    ///
+    /// nexus-rs patch (3 of 3, part b): the gate for the systems that tick,
+    /// emit and clear. A finished transition is not "active", but it still
+    /// has one terminal frame to emit and one clear to receive.
+    pub(crate) fn has_animations_or_transitions(&self) -> bool {
+        !self.transitions.is_empty()
+            || self
+                .animations
+                .values()
+                .any(|animations| !animations.is_empty())
+    }
+
     pub(crate) fn has_tickable_animations_or_transitions(&self) -> bool {
         self.transitions.values().any(|t| t.can_be_ticked())
             || self
@@ -623,18 +653,53 @@ impl StyleProperties {
     }
 
     pub(crate) fn clear_finished_and_canceled_animations(&mut self) {
-        self.transitions.retain(|_, transition| {
-            !matches!(
+        // nexus-rs patch (3 of 3, part c): a property that nothing animates
+        // any more stops counting as animated. Without this the entry in
+        // `last_computed_animation_values` outlived the transition, and
+        // `apply_computed_properties` treated every later change of that
+        // property as "an animation is emitting, never apply the computed
+        // value" -- a hover that had finished silently pinned the property
+        // against every non-transitioned restyle for good. Only a property
+        // with no remaining transition and no remaining animation is
+        // released, so an animation that still owns the property keeps its
+        // last emitted value as the comparison base.
+        let mut released = FxHashSet::default();
+        self.transitions.retain(|property_id, transition| {
+            let keep = !matches!(
                 transition.state,
                 TransitionState::Finished | TransitionState::Canceled
-            )
+            );
+            if !keep {
+                released.insert(*property_id);
+            }
+            keep
         });
 
         self.animations.retain(|_, animations| {
-            animations
+            let keep = animations
                 .iter()
-                .all(|(_, a)| a.state != AnimationState::Canceled)
+                .all(|(_, a)| a.state != AnimationState::Canceled);
+            if !keep {
+                released.extend(animations.iter().map(|(property_id, _)| *property_id));
+            }
+            keep
         });
+
+        let transitions = &self.transitions;
+        let animations = &self.animations;
+        let last_computed_animation_values = &mut self.last_computed_animation_values;
+        released
+            .into_iter()
+            .filter(|property_id| {
+                !transitions.contains_key(property_id)
+                    && !animations
+                        .values()
+                        .flatten()
+                        .any(|(driven, _)| driven == property_id)
+            })
+            .for_each(|property_id| {
+                last_computed_animation_values.set_if_neq(property_id, ComputedValue::None);
+            });
     }
 
     pub(crate) fn has_pending_events(&self) -> bool {

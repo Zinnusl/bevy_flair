@@ -563,7 +563,12 @@ pub(crate) fn set_animation_computed_values(
     #[cfg(feature = "detailed_trace")] debug_helper: PropertyIdDebugHelperParam,
 ) {
     for (_name_or_entity, mut properties, mut marker) in &mut properties_query {
-        if properties.has_active_animations_or_transitions() {
+        // nexus-rs patch (2 of 3): `has_animations_or_transitions` rather than
+        // `has_active_animations_or_transitions`. A transition's terminal frame
+        // is `Finished`, which is not "active", so an entity whose last
+        // transition just finished never reached this system and its target
+        // value was never emitted nor marked for apply.
+        if properties.has_animations_or_transitions() {
             marker.set_needs_apply_pending_properties();
             properties.set_animation_computed_values(&static_property_maps);
 
@@ -641,9 +646,18 @@ pub(crate) fn tick_animations<T: Default + Send + Sync + 'static>(
     let delta = time.delta();
 
     for mut properties in &mut properties_query {
-        if properties.has_tickable_animations_or_transitions() {
-            properties.tick_animations(delta);
+        // nexus-rs patch (1 of 3): the clear runs BEFORE the tick, on the
+        // frame after a transition finished, rather than in the same call.
+        // Ticking and clearing together removed a transition the instant it
+        // became `Finished`, one system before `set_animation_computed_values`
+        // could emit its target, so the last value ever applied was the last
+        // `Running` sample (and nothing at all when one frame spanned the
+        // whole transition). Kept until the next tick, a finished or canceled
+        // transition gets the one terminal frame a `JustFinished` animation
+        // already has.
+        if properties.has_animations_or_transitions() {
             properties.clear_finished_and_canceled_animations();
+            properties.tick_animations(delta);
         }
     }
 }
