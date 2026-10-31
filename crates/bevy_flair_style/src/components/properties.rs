@@ -250,7 +250,13 @@ impl StyleProperties {
                 .set_if_neq(property_id, ComputedValue::Value(to_value.clone()));
 
             match self.transitions.entry(property_id) {
-                Entry::Occupied(mut occupied) => {
+                // nexus-rs patch (4 of 4): only a running transition is reversed. A finished or
+                // canceled one waits out its terminal frame (patch 1 keeps it until the next
+                // tick), but CSS has no running transition to reverse there: a completed
+                // transition is removed and the change starts a new one. Reversing it read the
+                // progress of a transition that is over, and a reversal shortened to zero length
+                // divided zero by zero into `Duration::from_secs_f32`.
+                Entry::Occupied(mut occupied) if occupied.get().is_active() => {
                     let previous_transition = occupied.get();
 
                     let new_transition = Transition::from_possibly_reversed_transition(
@@ -270,7 +276,7 @@ impl StyleProperties {
                     trace!("Replaced transition: {new_transition:?}");
                     *occupied.get_mut() = new_transition;
                 }
-                Entry::Vacant(vacant) => {
+                entry => {
                     let new_transition = Transition::new(
                         property_id,
                         Some(from_value),
@@ -286,7 +292,7 @@ impl StyleProperties {
                     );
 
                     trace!("New transition: {new_transition:?}");
-                    vacant.insert(new_transition);
+                    entry.insert_entry(new_transition);
                 }
             }
         }
@@ -1658,6 +1664,55 @@ mod tests {
                 from: value!(2.0),
                 to: value!(5.0),
             }]
+        );
+    }
+
+    /// One frame of a clock that does not move, as a paused or pinned `Time<Real>` gives, in the
+    /// order `systems::tick_animations` runs it: clear, then tick.
+    fn frame_at_a_stopped_clock(properties: &mut StyleProperties) {
+        properties.clear_finished_and_canceled_animations();
+        properties.tick_animations(Duration::ZERO);
+    }
+
+    #[test]
+    fn a_finished_zero_length_reversal_is_replaced_rather_than_reversed() {
+        let mut properties = new_properties();
+        properties.set_transition_options(PropertiesHashMap::from_iter(properties! {
+            PROPERTY_1 => TRANSITION_1_SECOND,
+        }));
+        set_property_values_and_compute!(properties, { PROPERTY_1 => 0.0 });
+        apply_computed_values!(properties);
+
+        // A hover: 0 -> 5 starts a transition the stopped clock never advances.
+        frame_at_a_stopped_clock(&mut properties);
+        set_property_values_and_compute!(properties, { PROPERTY_1 => 5.0 });
+        apply_computed_values!(properties);
+
+        // A press back to 0 reverses it at progress zero, which shortens the reversal to nothing.
+        frame_at_a_stopped_clock(&mut properties);
+        set_property_values_and_compute!(properties, { PROPERTY_1 => 0.0 });
+        apply_computed_values!(properties);
+        assert_eq!(
+            properties.transitions[&property_id!(PROPERTY_1)].duration,
+            Duration::ZERO
+        );
+
+        // The next tick finishes that reversal, which stays for its terminal frame.
+        frame_at_a_stopped_clock(&mut properties);
+        assert_eq!(properties.active_transitions().count(), 0);
+        mem::take(&mut properties.pending_transition_events);
+
+        // The release's hover back to 5 starts afresh, since nothing is running to reverse.
+        set_property_values_and_compute!(properties, { PROPERTY_1 => 5.0 });
+        apply_computed_values!(properties);
+        let transition = &properties.transitions[&property_id!(PROPERTY_1)];
+        assert_eq!(transition.from, value!(0.0));
+        assert_eq!(transition.to, value!(5.0));
+        assert_eq!(transition.duration, Duration::from_secs(1));
+        assert_eq!(
+            properties.pending_transition_events,
+            vec![],
+            "a transition that already finished is not reported as replaced"
         );
     }
     #[test]
